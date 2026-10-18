@@ -1,0 +1,13 @@
+.{
+    .name = .lenore_fsr,
+    .fingerprint = 0xf42f00528d9198d2,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .fidelityfx = .{
+            .url = "https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/archive/c6efa6bf7f2027b3ec94f28578bb5965eabb9e55.tar.gz",
+            .hash = "N-V-__8AAHBHrRrWyBqiK53OWNLGcrHU0_D9p0Ggj2mEtI7n",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "tests", "tools", "LICENSE", "NOTICE.md", "AUTHORS" },
+}
