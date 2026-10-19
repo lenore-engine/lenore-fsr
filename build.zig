@@ -7,10 +7,24 @@ pub fn build(b: *std.Build) void {
     const upstream = b.dependency("fidelityfx", .{});
     const overlay = patchedOverlay(b, upstream);
 
+    // Forwarded with the same arguments the engine passes, so a build holding
+    // both resolves one `lenore-gpu` and not two whose types differ.
+    const shader_stats = b.option(
+        bool,
+        "shader-stats",
+        "Create pipelines so their compiled statistics can be read back",
+    ) orelse false;
+    const gpu = b.dependency("lenore_gpu", .{
+        .target = target,
+        .optimize = optimize,
+        .@"shader-stats" = shader_stats,
+    });
+
     const mod = b.addModule("lenore-fsr", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "lenore-gpu", .module = gpu.module("lenore-gpu") }},
     });
     addHost(b, mod, upstream, overlay);
     addShaders(b, mod, upstream, overlay);
@@ -23,6 +37,14 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // The C++ compiler's layout of the types `src/ffx.zig` declares by hand,
+    // compiled as the host is so that both see the same headers.
+    unit_tests.root_module.addCSourceFile(.{
+        .file = b.path("tests/ffx_layout.cpp"),
+        .flags = hostFlags(b),
+    });
+    addHostIncludes(unit_tests.root_module, upstream, overlay);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
@@ -105,6 +127,42 @@ const patches = [_]Patch{
             ,
         }},
     },
+    // The 16-bit variants. `FFX_TO_FLOAT16(1.0)` is `asfloat16` of a float
+    // literal: DXC reads the literal as a half and the call as the identity,
+    // Slang finds two overloads and refuses. What is meant is a half one.
+    .{
+        .source = "sdk/include/FidelityFX/gpu/ffx_core_gpu_common_half.h",
+        .overlay = "ffx_core_gpu_common_half.h",
+        .edits = &.{
+            .{
+                .from = "FFX_TO_UINT16(FFX_TO_FLOAT16(1.0))",
+                .to = "FFX_TO_UINT16(FfxFloat16(1.0))",
+            },
+            .{
+                .from = "FfxUInt16x2(FFX_TO_FLOAT16(1.0), FFX_TO_FLOAT16(1.0))",
+                .to = "FfxUInt16x2(FfxFloat16(1.0), FfxFloat16(1.0))",
+            },
+            .{
+                .from = "FfxUInt16x3(FFX_TO_FLOAT16(1.0), FFX_TO_FLOAT16(1.0), FFX_TO_FLOAT16(1.0))",
+                .to = "FfxUInt16x3(FfxFloat16(1.0), FfxFloat16(1.0), FfxFloat16(1.0))",
+            },
+            .{
+                .from = "FfxUInt16x4(FFX_TO_FLOAT16(1.0), FFX_TO_FLOAT16(1.0), FFX_TO_FLOAT16(1.0), FFX_TO_FLOAT16(1.0))",
+                .to = "FfxUInt16x4(FfxFloat16(1.0), FfxFloat16(1.0), FfxFloat16(1.0), FfxFloat16(1.0))",
+            },
+        },
+    },
+    // Unchanged. The header above is included as `"ffx_core_gpu_common_half.h"`
+    // by this one, which sits in the same directory upstream, and a quoted
+    // include looks beside its includer before the search path. A copy here
+    // is what makes that look find the rewritten file. Everything that
+    // includes this one does so from another directory, through the search
+    // path, so it finds the copy first.
+    .{
+        .source = "sdk/include/FidelityFX/gpu/ffx_core.h",
+        .overlay = "ffx_core.h",
+        .edits = &.{},
+    },
 };
 
 fn patchedOverlay(b: *std.Build, upstream: *std.Build.Dependency) std.Build.LazyPath {
@@ -145,30 +203,42 @@ fn addHost(
             "shared/ffx_message.cpp",
             "shared/ffx_object_management.cpp",
         },
-        // No exceptions and no RTTI: nothing upstream throws, and the component
-        // is reached through a C surface that could not carry either.
-        //
-        // `-fshort-wchar` would match the Windows size the context was laid out
-        // for, and is wrong: the objects then call musl's `wcscmp`, which reads
-        // four-byte units. The context size is patched instead.
-        //
-        // The forced include is named by its path, not found on the include
-        // path: the compiler's cache resolves a bare name against the working
-        // directory and fails before the compiler runs.
-        .flags = &.{
-            "-std=c++17",
-            "-fno-exceptions",
-            "-fno-rtti",
-            "-include",
-            b.root.joinString(b.allocator, "src/compat/ffx_compat.h") catch @panic("OOM"),
-        },
+        .flags = hostFlags(b),
     });
-    // The overlay is searched first, so the patched `ffx_types.h` is the one
-    // every `<FidelityFX/host/ffx_types.h>` resolves to.
-    mod.addIncludePath(overlay);
-    mod.addIncludePath(upstream.path("sdk/include"));
+    addHostIncludes(mod, upstream, overlay);
     mod.addIncludePath(upstream.path("sdk/src/shared"));
     mod.link_libcpp = true;
+}
+
+// No exceptions and no RTTI: nothing upstream throws, and the component is
+// reached through a C surface that could not carry either.
+//
+// `-fshort-wchar` would match the Windows size the context was laid out for,
+// and is wrong: the objects then call musl's `wcscmp`, which reads four-byte
+// units. The context size is patched instead.
+//
+// The forced include is named by its path, not found on the include path: the
+// compiler's cache resolves a bare name against the working directory and fails
+// before the compiler runs.
+fn hostFlags(b: *std.Build) []const []const u8 {
+    return b.allocator.dupe([]const u8, &.{
+        "-std=c++17",
+        "-fno-exceptions",
+        "-fno-rtti",
+        "-include",
+        b.root.joinString(b.allocator, "src/compat/ffx_compat.h") catch @panic("OOM"),
+    }) catch @panic("OOM");
+}
+
+// The overlay is searched first, so the patched `ffx_types.h` is the one every
+// `<FidelityFX/host/ffx_types.h>` resolves to.
+fn addHostIncludes(
+    mod: *std.Build.Module,
+    upstream: *std.Build.Dependency,
+    overlay: std.Build.LazyPath,
+) void {
+    mod.addIncludePath(overlay);
+    mod.addIncludePath(upstream.path("sdk/include"));
 }
 
 // The ten compute passes, by the stem of their upstream file
@@ -192,13 +262,14 @@ const passes = [_][]const u8{
 // backend reports (`getPipelinePermutationFlags` in `ffx_fsr3upscaler.cpp`).
 // The engine's inputs fix all but sharpening, and the backend fixes the rest
 // by what it reports, so one variant per pass is built, plus `accumulate` with
-// sharpening, which the component selects per dispatch.
+// sharpening, which the component selects per dispatch; and `half_passes`
+// again in 16-bit arithmetic, which the backend offers by the device and the
+// caller's choice.
 //
 // Fixed by the engine's inputs: colour is HDR, motion vectors are at render
 // resolution and carry no jitter, depth is not inverted.
 //
-// Fixed by the backend: no 16-bit arithmetic and no forced wave64 (shader
-// model 6.2). It reports the device's 32-64 lane range, which is what makes the
+// Fixed by the backend: no forced wave64 (shader model 6.2). It reports the device's 32-64 lane range, which is what makes the
 // component choose the lookup-table Lanczos for reprojection.
 const permutation_defines = [_][]const u8{
     "-DFFX_FSR3UPSCALER_OPTION_REPROJECT_USE_LANCZOS_TYPE=1",
@@ -214,7 +285,6 @@ const permutation_defines = [_][]const u8{
 const base_defines = [_][]const u8{
     "-DFFX_GPU=1",
     "-DFFX_HLSL=1",
-    "-DFFX_HALF=0",
     "-DFFX_HLSL_SM=62",
     "-DFFX_FSR3UPSCALER_OPTION_UPSAMPLE_SAMPLERS_USE_DATA_HALF=0",
     "-DFFX_FSR3UPSCALER_OPTION_ACCUMULATE_SAMPLERS_USE_DATA_HALF=0",
@@ -245,10 +315,25 @@ fn addShaders(
     overlay: std.Build.LazyPath,
 ) void {
     for (passes) |pass| {
-        addPass(b, mod, upstream, overlay, pass, false);
-        if (std.mem.eql(u8, pass, "accumulate")) addPass(b, mod, upstream, overlay, pass, true);
+        addPass(b, mod, upstream, overlay, pass, false, false);
+        if (std.mem.eql(u8, pass, "accumulate")) addPass(b, mod, upstream, overlay, pass, true, false);
+    }
+    for (half_passes) |pass| {
+        addPass(b, mod, upstream, overlay, pass, false, true);
+        if (std.mem.eql(u8, pass, "accumulate")) addPass(b, mod, upstream, overlay, pass, true, true);
     }
 }
+
+// The passes upstream builds in 16-bit arithmetic too, which are the only ones
+// its selector loads that way (`ffx_fsr3upscaler_shaderblobs.cpp`); the others'
+// 16-bit sources are not meant to run. RCAS has one upstream, but the host asks
+// for it only on Xbox.
+const half_passes = [_][]const u8{
+    "shading_change",
+    "prepare_reactivity",
+    "accumulate",
+    "autogen_reactive",
+};
 
 fn addPass(
     b: *std.Build,
@@ -257,8 +342,13 @@ fn addPass(
     overlay: std.Build.LazyPath,
     pass: []const u8,
     sharpen: bool,
+    half: bool,
 ) void {
-    const name = if (sharpen) b.fmt("fsr3upscaler_{s}_sharpen", .{pass}) else b.fmt("fsr3upscaler_{s}", .{pass});
+    const name = b.fmt("fsr3upscaler_{s}{s}{s}", .{
+        pass,
+        if (sharpen) "_sharpen" else "",
+        if (half) "_fp16" else "",
+    });
 
     const command = b.addSystemCommand(&.{
         "slangc",
@@ -291,6 +381,7 @@ fn addPass(
     command.addArgs(&base_defines);
     command.addArgs(&permutation_defines);
     command.addArg(if (sharpen) "-DFFX_FSR3UPSCALER_OPTION_APPLY_SHARPENING=1" else "-DFFX_FSR3UPSCALER_OPTION_APPLY_SHARPENING=0");
+    command.addArg(if (half) "-DFFX_HALF=1" else "-DFFX_HALF=0");
     // The overlay first, so a pass including a patched header gets the copy.
     command.addPrefixedDirectoryArg("-I", overlay);
     command.addPrefixedDirectoryArg("-I", upstream.path("sdk/include/FidelityFX/gpu"));

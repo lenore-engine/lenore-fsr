@@ -1,15 +1,16 @@
 const std = @import("std");
 
-// Copies one file with exact-text replacements applied.
+// Copies one file with exact-text replacements applied, or with none, for a
+// file that has to sit beside a rewritten one for its includes to find it.
 //
 // Tooling for the build: it is how the FidelityFX sources are patched without
 // touching the pinned package. Each <from> must occur exactly once in the input.
 // A pin moved to a release whose text differs then fails the build here rather
 // than leaving a replacement unapplied or applying it somewhere else.
 //
-// Usage: replace <in> <out> (<from> <to>)...
+// Usage: replace <in> <out> [<from> <to>]...
 
-const usage = "usage: replace <in> <out> (<from> <to>)...\n";
+const usage = "usage: replace <in> <out> [<from> <to>]...\n";
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -21,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
 
     var args: std.ArrayList([]const u8) = .empty;
     while (argv.next()) |arg| try args.append(arena, arg);
-    if (args.items.len < 4 or args.items.len % 2 != 0) {
+    if (args.items.len < 2 or args.items.len % 2 != 0) {
         std.debug.print(usage, .{});
         return error.InvalidUsage;
     }
